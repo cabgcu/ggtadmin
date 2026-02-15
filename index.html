@@ -14,7 +14,7 @@
       import { getFirestore, collection, doc, onSnapshot, setDoc, getDocs, writeBatch, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
       import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 
-      // 1. Production Configuration for gcu-s-got-talent-2026
+      // 1. Production Configuration
       const firebaseConfig = {
         apiKey: "AIzaSyAsQeD83RdAyZPJZeAOif1gSasMhv2zp3M",
         authDomain: "gcu-s-got-talent-2026.firebaseapp.com",
@@ -24,7 +24,6 @@
         appId: "1:999052757013:web:3f75bdbf48f921b831a61c"
       };
 
-      // Exact path where your IDs are located
       const appId = 'c_97156435f4eefd8e_importer.html-977';
       const ADMIN_PASSWORD = "Cabgcu49!";
       
@@ -41,6 +40,8 @@
 
       let isVotingOpen = true;
       let syncStarted = false;
+      let arenaVotes = [];
+      let onlineVotes = [];
 
       function updateIndicator(text, color = null) {
         const el = document.getElementById('arena-indicator');
@@ -50,10 +51,6 @@
         }
       }
 
-      /**
-       * LOGIN FLOW
-       * Optimized to prevent "INITIALIZING..." hang in Chrome
-       */
       window.attemptLogin = async function() {
         const passInput = document.getElementById('admin-pass');
         const loginBtn = document.querySelector('.login-btn');
@@ -62,23 +59,19 @@
         if (passInput.value === ADMIN_PASSWORD) {
             loginBtn.disabled = true;
             loginBtn.innerText = "VERIFYING...";
-            
             try {
                 if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                     await signInWithCustomToken(auth, __initial_auth_token).catch(() => signInAnonymously(auth));
                 } else {
                     await signInAnonymously(auth);
                 }
-                
                 document.getElementById('view-login').style.display = 'none';
                 document.getElementById('view-admin').style.display = 'block';
-                
                 startSync();
             } catch (e) {
-                console.error(e);
                 loginBtn.disabled = false;
                 loginBtn.innerText = "Log In";
-                errorMsg.innerText = "Auth Error. Please check connection.";
+                errorMsg.innerText = "Auth Error. Please refresh.";
             }
         } else {
             errorMsg.innerText = "Incorrect Password.";
@@ -88,9 +81,6 @@
 
       window.handlePassKey = (e) => { if (e.key === 'Enter') attemptLogin(); };
 
-      /**
-       * DATA SYNC
-       */
       function startSync() {
         if (syncStarted) return;
         syncStarted = true;
@@ -98,99 +88,60 @@
         updateIndicator("ESTABLISHING LINK...");
         
         const settingsRef = doc(db, 'artifacts', appId, 'public', 'data', 'status', 'settings');
-        const votesRef = collection(db, 'artifacts', appId, 'public', 'data', 'votes');
+        const arenaVotesRef = collection(db, 'artifacts', appId, 'public', 'data', 'votes');
+        const onlineVotesRef = collection(db, 'artifacts', appId, 'public', 'data', 'online_votes');
 
         onSnapshot(settingsRef, (snap) => {
           if (snap.exists()) {
             isVotingOpen = snap.data().open !== false;
             updateStatusUI();
-          } else {
-            updateIndicator("DATABASE READY", "#0A84FF");
           }
-        }, (err) => {
-          updateIndicator("LINK BLOCKED: " + err.code, "#ff453a");
+        }, (err) => updateIndicator("LINK BLOCKED: " + err.code, "#ff453a"));
+
+        // Arena Vote Sync
+        onSnapshot(arenaVotesRef, (snapshot) => {
+          arenaVotes = [];
+          snapshot.forEach(doc => arenaVotes.push(doc.data()));
+          renderAllData();
         });
 
-        onSnapshot(votesRef, (snapshot) => {
-          const votes = [];
-          snapshot.forEach(doc => votes.push(doc.data()));
-          
-          document.getElementById('db-status').innerText = `STABLE: ${votes.length} RECORDS`;
-          renderStats(votes);
-          renderRecentFeed(votes);
-          
-          if (isVotingOpen) updateStatusUI(); 
-        }, (err) => {
-          console.error(err);
-          document.getElementById('db-status').innerText = "VOTE FEED ERROR";
+        // Online/VIP Vote Sync
+        onSnapshot(onlineVotesRef, (snapshot) => {
+          onlineVotes = [];
+          snapshot.forEach(doc => onlineVotes.push(doc.data()));
+          renderAllData();
         });
       }
 
-      window.toggleVoting = async function() {
-        const btn = document.getElementById('toggle-btn');
-        btn.disabled = true;
-        try {
-          const settingsRef = doc(db, 'artifacts', appId, 'public', 'data', 'status', 'settings');
-          await setDoc(settingsRef, { open: !isVotingOpen }, { merge: true });
-        } catch (e) {
-          alert("Permission Denied: Ensure rules are published.");
-        } finally {
-          btn.disabled = false;
-        }
-      };
+      function renderAllData() {
+        const total = arenaVotes.length + onlineVotes.length;
+        document.getElementById('total-votes-count').innerText = total.toLocaleString();
+        document.getElementById('arena-split-count').innerText = arenaVotes.length.toLocaleString();
+        document.getElementById('online-split-count').innerText = onlineVotes.length.toLocaleString();
+        document.getElementById('db-status').innerText = `LIVE: ${total} TOTAL RECORDS`;
 
-      window.resetVotes = async function() {
-        if (!confirm("⚠️ This will wipe ALL votes for GGT 2026. Continue?")) return;
-        const btn = document.getElementById('reset-btn');
-        btn.disabled = true;
-        btn.innerText = "CLEARING...";
+        renderStatsGrid('stats-grid-combined', [...arenaVotes, ...onlineVotes], "COMBINED");
+        renderStatsGrid('stats-grid-arena', arenaVotes, "ARENA ONLY");
+        renderStatsGrid('stats-grid-online', onlineVotes, "VIP ONLY");
         
-        try {
-          const votesRef = collection(db, 'artifacts', appId, 'public', 'data', 'votes');
-          const snap = await getDocs(votesRef);
-          
-          const chunks = [];
-          const docs = [...snap.docs];
-          while (docs.length) chunks.push(docs.splice(0, 400));
-          
-          for (const chunk of chunks) {
-            const batch = writeBatch(db);
-            chunk.forEach(d => batch.delete(d.ref));
-            await batch.commit();
-          }
-          alert("Reset Complete.");
-        } catch (e) {
-          alert("Reset Failed: " + e.message);
-        } finally {
-          btn.disabled = false;
-          btn.innerText = "Reset All Data";
-        }
-      };
-
-      function updateStatusUI() {
-        const btn = document.getElementById('toggle-btn');
-        const indicator = document.getElementById('arena-indicator');
-        btn.innerText = isVotingOpen ? "Close Voting" : "Open Voting";
-        btn.style.background = isVotingOpen ? "#FF453A" : "#30D158";
-        // User requested "Voting is Open/Closed"
-        indicator.innerText = isVotingOpen ? "VOTING IS OPEN" : "VOTING IS CLOSED";
-        indicator.style.color = isVotingOpen ? "#30d158" : "#ff453a";
+        renderRecentFeed([...arenaVotes, ...onlineVotes]);
       }
 
-      function renderStats(votes) {
+      function renderStatsGrid(elementId, dataset, label) {
         const counts = {};
-        votes.forEach(v => { counts[v.performerId] = (counts[v.performerId] || 0) + 1; });
+        dataset.forEach(v => { counts[v.performerId] = (counts[v.performerId] || 0) + 1; });
         const sorted = contestants.map(c => ({ ...c, count: counts[c.id] || 0 }))
                                   .sort((a, b) => b.count - a.count || a.id - b.id);
 
-        document.getElementById('total-votes-count').innerText = votes.length.toLocaleString();
-        const grid = document.getElementById('stats-grid');
+        const grid = document.getElementById(elementId);
+        const max = Math.max(dataset.length, 1);
+        
         grid.innerHTML = sorted.map((c, i) => `
           <div class="stat-card">
             <div class="rank">RANK #${i+1}</div>
             <div class="performer-name">${c.name}</div>
             <div class="vote-count">${c.count.toLocaleString()}</div>
-            <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${(c.count / (Math.max(votes.length, 1)) * 100)}%"></div></div>
+            <div class="progress-bar-bg"><div class="progress-bar-fill" style="width: ${(c.count / max * 100)}%"></div></div>
           </div>
         `).join('');
       }
@@ -204,43 +155,86 @@
         const list = document.getElementById('recent-list');
         list.innerHTML = recent.length ? recent.map(v => `
           <div class="feed-item">
-            <span><strong>${v.studentId || 'ID:' + v.voterUid?.slice(0,4)}</strong> → ${v.performerName || 'Unknown'}</span>
+            <span><strong>${v.studentId || v.voterName || 'VIP'}</strong> → ${v.performerName}</span>
             <span class="timestamp">${new Date(v.timestamp.seconds * 1000).toLocaleTimeString()}</span>
           </div>
-        `).join('') : '<div style="color:#444; padding:20px; text-align:center;">Awaiting Arena Feed...</div>';
+        `).join('') : '<div style="color:#444; padding:20px; text-align:center;">Awaiting Activity...</div>';
+      }
+
+      window.toggleVoting = async function() {
+        const btn = document.getElementById('toggle-btn');
+        btn.disabled = true;
+        try {
+          const settingsRef = doc(db, 'artifacts', appId, 'public', 'data', 'status', 'settings');
+          await setDoc(settingsRef, { open: !isVotingOpen }, { merge: true });
+        } finally { btn.disabled = false; }
+      };
+
+      window.resetVotes = async function() {
+        if (!confirm("⚠️ This will wipe ALL Arena AND Online votes. Continue?")) return;
+        const btn = document.getElementById('reset-btn');
+        btn.disabled = true;
+        btn.innerText = "CLEARING...";
+        try {
+          const arenaSnap = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'votes'));
+          const onlineSnap = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'online_votes'));
+          
+          const allDocs = [...arenaSnap.docs, ...onlineSnap.docs];
+          while (allDocs.length) {
+            const batch = writeBatch(db);
+            const chunk = allDocs.splice(0, 400);
+            chunk.forEach(d => batch.delete(d.ref));
+            await batch.commit();
+          }
+          alert("Reset Complete.");
+        } finally { 
+          btn.disabled = false; 
+          btn.innerText = "Reset All Data";
+        }
+      };
+
+      function updateStatusUI() {
+        const btn = document.getElementById('toggle-btn');
+        const indicator = document.getElementById('arena-indicator');
+        btn.innerText = isVotingOpen ? "Close Voting" : "Open Voting";
+        btn.style.background = isVotingOpen ? "#FF453A" : "#30D158";
+        indicator.innerText = isVotingOpen ? "VOTING IS OPEN" : "VOTING IS CLOSED";
+        indicator.style.color = isVotingOpen ? "#30d158" : "#ff453a";
       }
     </script>
 
     <style>
         :root { --bg: #000; --glass: rgba(15,15,18,0.96); --border: rgba(255,255,255,0.12); --accent: #0A84FF; --text: #fff; }
         * { box-sizing: border-box; }
-        body { margin: 0; font-family: -apple-system, system-ui, sans-serif; color: var(--text); background: var(--bg); padding: 20px; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        body { margin: 0; font-family: -apple-system, system-ui, sans-serif; color: var(--text); background: var(--bg); padding: 20px; min-height: 100vh; }
         #bg-container { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: -2; background-image: radial-gradient(circle at 10% 20%, rgba(10,132,255,0.1) 0%, transparent 45%), radial-gradient(circle at 90% 80%, rgba(191,90,242,0.1) 0%, transparent 45%); }
-        .container { width: 100%; max-width: 1100px; }
-        #view-login { width: 100%; max-width: 380px; text-align: center; }
-        .login-card { background: var(--glass); backdrop-filter: blur(30px); padding: 40px 32px; border-radius: 32px; border: 1px solid var(--border); box-shadow: 0 40px 80px rgba(0,0,0,0.6); }
+        .container { width: 100%; max-width: 1200px; margin: 0 auto; }
+        #view-login { height: 80vh; display: flex; align-items: center; justify-content: center; }
+        .login-card { background: var(--glass); backdrop-filter: blur(30px); padding: 40px 32px; border-radius: 32px; border: 1px solid var(--border); width: 380px; text-align: center; }
         .login-input { width: 100%; background: rgba(0,0,0,0.5); border: 1px solid var(--border); padding: 18px; border-radius: 16px; color: #fff; text-align: center; margin: 20px 0; outline: none; font-weight: 800; font-size: 1rem; }
-        .login-btn { width: 100%; background: var(--accent); color: #fff; border: none; padding: 18px; border-radius: 100px; font-weight: 900; cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em; }
+        .login-btn { width: 100%; background: var(--accent); color: #fff; border: none; padding: 18px; border-radius: 100px; font-weight: 900; cursor: pointer; text-transform: uppercase; }
         #view-admin { display: none; width: 100%; }
         header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 1px solid var(--border); padding-bottom: 20px; }
-        .main-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; margin-bottom: 40px; }
-        .control-card { background: var(--glass); padding: 35px; border-radius: 32px; border: 1px solid var(--border); text-align: center; }
-        .big-number { font-size: 4.5rem; font-weight: 900; color: var(--accent); line-height: 1; letter-spacing: -0.05em; }
-        .label { font-size: 0.7rem; text-transform: uppercase; font-weight: 900; letter-spacing: 0.15em; color: #fff; margin: 12px 0; }
-        .toggle-btn { width: 100%; border: none; padding: 22px; border-radius: 100px; color: #fff; font-weight: 900; cursor: pointer; text-transform: uppercase; font-size: 1rem; }
-        .reset-btn { background: none; border: 1px solid rgba(255,69,58,0.2); color: #ff453a; font-size: 0.7rem; padding: 12px; border-radius: 14px; margin-top: 30px; cursor: pointer; width: 100%; font-weight: 900; text-transform: uppercase; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 18px; margin-bottom: 40px; }
-        .stat-card { background: var(--glass); border-radius: 28px; border: 1px solid var(--border); padding: 28px; }
-        .rank { font-size: 0.65rem; font-weight: 900; color: var(--accent); margin-bottom: 12px; }
-        .performer-name { font-weight: 900; font-size: 1.15rem; text-transform: uppercase; letter-spacing: -0.03em; }
-        .vote-count { font-size: 2.2rem; font-weight: 900; margin: 10px 0; }
-        .progress-bar-bg { height: 8px; background: rgba(255,255,255,0.04); border-radius: 10px; overflow: hidden; margin-top: 15px; }
-        .progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), #BF5AF2); transition: width 1.2s cubic-bezier(0.23, 1, 0.32, 1); }
-        .recent-feed { background: var(--glass); padding: 35px; border-radius: 32px; border: 1px solid var(--border); text-align: left; }
-        .feed-item { padding: 15px 0; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; font-size: 0.9rem; }
-        .feed-item:last-child { border-bottom: none; }
-        .timestamp { color: #555; font-size: 0.75rem; font-family: monospace; }
-        #db-status { font-size: 0.65rem; font-weight: 900; color: var(--accent); margin-top: 10px; }
+        .main-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 15px; margin-bottom: 40px; }
+        .control-card { background: var(--glass); padding: 30px; border-radius: 28px; border: 1px solid var(--border); text-align: center; display: flex; flex-direction: column; justify-content: center; }
+        .big-number { font-size: 3.5rem; font-weight: 900; color: var(--accent); line-height: 1; letter-spacing: -0.05em; }
+        .label { font-size: 0.7rem; text-transform: uppercase; font-weight: 900; letter-spacing: 0.15em; color: #fff; margin: 10px 0; }
+        .toggle-btn { width: 100%; border: none; padding: 20px; border-radius: 100px; color: #fff; font-weight: 900; cursor: pointer; text-transform: uppercase; }
+        .reset-btn { background: none; border: 1px solid rgba(255,69,58,0.2); color: #ff453a; font-size: 0.7rem; padding: 12px; border-radius: 14px; margin-top: 20px; cursor: pointer; width: 100%; font-weight: 900; text-transform: uppercase; }
+        .section-header { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; margin-top: 40px; }
+        .section-header .line { flex: 1; height: 1px; background: var(--border); }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 15px; margin-bottom: 40px; }
+        .stat-card { background: var(--glass); border-radius: 24px; border: 1px solid var(--border); padding: 24px; }
+        .rank { font-size: 0.6rem; font-weight: 900; color: var(--accent); margin-bottom: 8px; }
+        .performer-name { font-weight: 900; font-size: 1.1rem; text-transform: uppercase; letter-spacing: -0.03em; }
+        .vote-count { font-size: 2rem; font-weight: 900; margin: 5px 0; }
+        .progress-bar-bg { height: 6px; background: rgba(255,255,255,0.04); border-radius: 10px; overflow: hidden; margin-top: 10px; }
+        .progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), #BF5AF2); transition: width 1.2s ease; }
+        .recent-feed { background: var(--glass); padding: 30px; border-radius: 32px; border: 1px solid var(--border); }
+        .feed-item { padding: 12px 0; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; }
+        .timestamp { color: #555; font-size: 0.75rem; }
+        #db-status { font-size: 0.65rem; font-weight: 900; color: var(--accent); margin-top: 8px; }
+        .sub-stat { font-size: 1.5rem; font-weight: 900; color: #fff; }
     </style>
 </head>
 <body>
@@ -249,7 +243,7 @@
 <!-- LOGIN -->
 <div id="view-login">
     <div class="login-card">
-        <div class="label">Canyon Activities Board</div>
+        <div class="label" style="opacity:0.4">Canyon Activities Board</div>
         <h1 style="margin: 10px 0 24px 0; font-size: 2rem; font-weight: 900; letter-spacing: -0.04em; text-transform: uppercase;">GGT VOTING ADMIN</h1>
         <input type="password" id="admin-pass" class="login-input" placeholder="ACCESS PASSWORD" onkeypress="handlePassKey(event)">
         <button class="login-btn" onclick="attemptLogin()">Log In</button>
@@ -261,31 +255,62 @@
 <div id="view-admin" class="container">
     <header>
         <h1 style="font-size:1.3rem; text-transform: uppercase; font-weight: 900; letter-spacing: -0.02em;">GGT VOTING ADMIN</h1>
-        <div id="status-badge" style="font-size: 0.65rem; font-weight: 900; padding: 6px 16px; border: 1px solid #fff; border-radius: 50px; text-transform: uppercase;">Admin Session</div>
+        <div style="font-size: 0.65rem; font-weight: 900; padding: 6px 16px; border: 1px solid #fff; border-radius: 50px; text-transform: uppercase;">LIVE DATA FEED</div>
     </header>
 
     <div class="main-controls">
         <div class="control-card">
             <div id="total-votes-count" class="big-number">0</div>
-            <div class="label">Total Arena Votes</div>
+            <div class="label">Total Combined Votes</div>
             <div id="db-status">SCANNING...</div>
         </div>
         <div class="control-card">
-            <div id="arena-indicator" class="label" style="margin-bottom:18px;">INITIALIZING...</div>
+            <div class="flex justify-around items-center">
+                <div>
+                    <div id="arena-split-count" class="sub-stat">0</div>
+                    <div class="label" style="font-size: 0.55rem;">Arena (ID)</div>
+                </div>
+                <div style="width:1px; height:40px; background: var(--border);"></div>
+                <div>
+                    <div id="online-split-count" class="sub-stat">0</div>
+                    <div class="label" style="font-size: 0.55rem;">VIP (Online)</div>
+                </div>
+            </div>
+        </div>
+        <div class="control-card">
+            <div id="arena-indicator" class="label" style="margin-bottom:12px;">INITIALIZING...</div>
             <button id="toggle-btn" class="toggle-btn" onclick="toggleVoting()">---</button>
             <button id="reset-btn" class="reset-btn" onclick="resetVotes()">Reset All Data</button>
         </div>
     </div>
 
-    <div class="label" style="margin-bottom:15px; opacity:0.6;">Real-Time Standings</div>
-    <div id="stats-grid" class="stats-grid"></div>
+    <!-- COMBINED STANDINGS -->
+    <div class="section-header">
+        <div class="label">Official Leaderboard (Combined)</div>
+        <div class="line"></div>
+    </div>
+    <div id="stats-grid-combined" class="stats-grid"></div>
+
+    <!-- ARENA STANDINGS -->
+    <div class="section-header">
+        <div class="label">Arena Votes (Student ID)</div>
+        <div class="line"></div>
+    </div>
+    <div id="stats-grid-arena" class="stats-grid"></div>
+
+    <!-- ONLINE/VIP STANDINGS -->
+    <div class="section-header">
+        <div class="label">VIP / Online Votes</div>
+        <div class="line"></div>
+    </div>
+    <div id="stats-grid-online" class="stats-grid"></div>
 
     <div class="recent-feed">
-        <div class="label" style="margin-bottom:15px; opacity:0.6;">Arena Activity Stream</div>
+        <div class="label" style="margin-bottom:15px; opacity:0.4;">Combined Activity Stream</div>
         <div id="recent-list"></div>
     </div>
     
-    <div class="label" style="margin-top: 50px; text-align: center;">
+    <div class="label" style="margin-top: 50px; text-align: center; opacity: 0.5;">
         © 2026 Canyon Activities Board
     </div>
 </div>
