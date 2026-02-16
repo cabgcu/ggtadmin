@@ -12,7 +12,7 @@
 
     <script type="module">
       import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-      import { getFirestore, collection, doc, onSnapshot, setDoc, getDoc, getDocs, writeBatch, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+      import { getFirestore, collection, doc, onSnapshot, setDoc, getDoc, getDocs, writeBatch, serverTimestamp, query, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
       import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 
       // 1. Configuration
@@ -84,14 +84,12 @@
           }
         });
 
-        // Sync Arena (QR) + SMS Votes
         onSnapshot(arenaVotesRef, (snapshot) => {
           allArenaVotes = [];
           snapshot.forEach(doc => allArenaVotes.push(doc.data()));
           renderAllData();
         });
 
-        // Sync Online/VIP Votes
         onSnapshot(onlineVotesRef, (snapshot) => {
           onlineVotes = [];
           snapshot.forEach(doc => onlineVotes.push(doc.data()));
@@ -100,7 +98,6 @@
       }
 
       function renderAllData() {
-        // Separate SMS from QR
         const smsVotes = allArenaVotes.filter(v => v.method === 'SMS');
         const trueArenaVotes = allArenaVotes.filter(v => v.method !== 'SMS');
         const total = allArenaVotes.length + onlineVotes.length;
@@ -190,8 +187,8 @@
         }
       };
 
-      // --- TURBO SMS IMPORT (Parallel Processing) ---
-      window.runSMSImport = function() {
+      // --- THE FINAL TURBO SMS IMPORT ---
+      window.runSMSImport = async function() {
         const file = document.getElementById('sms-csv').files[0];
         if(!file) return alert("Select CSV!");
 
@@ -199,80 +196,107 @@
         const status = document.getElementById('import-status');
         
         btn.disabled = true;
-        status.innerText = "🚀 STARTING TURBO SYNC...";
-        status.style.color = "#FF9F0A"; // Orange
+        status.innerText = "🚀 DOWNLOADING MASTER ID CACHE...";
+        status.style.color = "#FF9F0A"; 
 
-        Papa.parse(file, {
-            header: false,
-            skipEmptyLines: true,
-            complete: async (results) => {
-                const rows = results.data.slice(1); // Skip header row
-                const total = rows.length;
-                
-                // Process in chunks of 100
-                const CHUNK_SIZE = 100;
-                let processed = 0;
-                let validAdded = 0;
-                let fakeBlocked = 0;
+        try {
+            // 1. Fetch Master List once for speed
+            const validSnapshot = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'valid_ids'));
+            const phoneTokenMap = new Map();
+            
+            validSnapshot.forEach(doc => {
+                const data = doc.data();
+                const last4 = data.phoneLast4 || (data.phone ? data.phone.replace(/\D/g, "").slice(-4) : null);
+                if (last4) {
+                    if (!phoneTokenMap.has(last4)) phoneTokenMap.set(last4, []);
+                    phoneTokenMap.get(last4).push(doc.id);
+                }
+            });
 
-                for (let i = 0; i < total; i += CHUNK_SIZE) {
-                    const chunk = rows.slice(i, i + CHUNK_SIZE);
-                    const batch = writeBatch(db);
-                    let batchHasUpdates = false;
+            // 2. Fetch all current votes once for Hard-Lock Check
+            const currentVotesSnap = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'votes'));
+            const votedSet = new Set();
+            currentVotesSnap.forEach(vDoc => {
+                const sId = vDoc.data().studentId;
+                if(sId) votedSet.add(sId);
+            });
 
-                    // 1. Create array of check promises (Parallel)
-                    const promises = chunk.map(async (row) => {
-                        const id = row[3]?.toString().trim(); // Col D
-                        const vote = row[6]?.toString().trim(); // Col G
+            status.innerText = "⚡ PROCESSING SMS SHEET...";
+
+            Papa.parse(file, {
+                header: false,
+                skipEmptyLines: true,
+                complete: async (results) => {
+                    let batch = writeBatch(db);
+                    let count = 0; let added = 0; let blocked = 0;
+                    
+                    const phoneUsageIndex = {};
+
+                    for (const row of results.data) {
+                        if (row[1]?.toString().trim() !== "Text (US)") continue; 
+
+                        const voteChoice = row[0]?.toString().trim(); // Col A
+                        const rawPhone = row[4]?.toString().trim();   // Col E
+                        const last4 = rawPhone?.replace(/\D/g, "").slice(-4);
                         
-                        if (!id || !vote) return null;
+                        const availableIDs = phoneTokenMap.get(last4);
 
-                        // Check ID validity against database
-                        const validRef = doc(db, 'artifacts', appId, 'public', 'data', 'valid_ids', id);
-                        
-                        try {
-                            const snap = await getDoc(validRef);
-                            if (snap.exists()) {
-                                const performer = contestants.find(c => vote.toLowerCase().includes(c.name.toLowerCase()));
+                        if (availableIDs) {
+                            if (typeof phoneUsageIndex[last4] === 'undefined') phoneUsageIndex[last4] = 0;
+                            
+                            // Try to find a Student ID linked to this phone that HAS NOT voted yet
+                            let foundUnvotedId = null;
+                            while (phoneUsageIndex[last4] < availableIDs.length) {
+                                const candidateId = availableIDs[phoneUsageIndex[last4]];
+                                if (!votedSet.has(candidateId)) {
+                                    foundUnvotedId = candidateId;
+                                    break;
+                                }
+                                phoneUsageIndex[last4]++; // Skip IDs that already have a vote in DB
+                            }
+
+                            if (foundUnvotedId) {
+                                const performer = contestants.find(c => voteChoice.toLowerCase().includes(c.name.toLowerCase()));
                                 if (performer) {
-                                    // Queue valid vote
-                                    const voteRef = doc(db, 'artifacts', appId, 'public', 'data', 'votes', id);
-                                    batch.set(voteRef, {
-                                        studentId: id,
+                                    const voteId = `${foundUnvotedId}_${performer.id}`;
+                                    batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'votes', voteId), {
+                                        studentId: foundUnvotedId,
                                         performerId: performer.id,
                                         performerName: performer.name,
                                         method: 'SMS',
                                         timestamp: serverTimestamp()
-                                    }, { merge: true });
-                                    return true; // Valid
+                                    });
+
+                                    votedSet.add(foundUnvotedId); // Mark as voted for this batch
+                                    phoneUsageIndex[last4]++; // Move to next ID for next time
+                                    added++;
+                                    count++;
                                 }
+                            } else {
+                                blocked++; // Either used all IDs for this phone or all IDs for this phone already voted
                             }
-                        } catch(e) { console.error(e); }
-                        return false; // Invalid/Fake
-                    });
+                        }
 
-                    // 2. Wait for chunk to finish
-                    const results = await Promise.all(promises);
-                    
-                    results.forEach(r => {
-                        if (r === true) { validAdded++; batchHasUpdates = true; }
-                        else if (r === false) { fakeBlocked++; }
-                    });
+                        if (count >= 400) {
+                            await batch.commit();
+                            batch = writeBatch(db);
+                            count = 0;
+                        }
+                    }
 
-                    // 3. Commit valid votes
-                    if (batchHasUpdates) await batch.commit();
+                    if (count > 0) await batch.commit();
 
-                    processed += chunk.length;
-                    const pct = Math.round((processed / total) * 100);
-                    status.innerText = `⚡ SPEED SYNC: ${pct}% COMPLETED...`;
+                    status.innerText = `✅ DONE: ${added} VOTES ADDED | ${blocked} BLOCKED (QUOTA/DUPLICATE)`;
+                    status.style.color = "#30D158";
+                    btn.disabled = false;
                 }
-
-                status.innerText = `✅ DONE: ${validAdded} ADDED | ${fakeBlocked} FAKES BLOCKED`;
-                status.style.color = "#30D158"; // Green
-                btn.disabled = false;
-                file.value = "";
-            }
-        });
+            });
+        } catch (e) {
+            console.error(e);
+            status.innerText = "❌ ERROR: " + e.message;
+            status.style.color = "red";
+            btn.disabled = false;
+        }
       };
 
       function updateStatusUI() {
@@ -318,7 +342,6 @@
         #db-status { font-size: 0.65rem; font-weight: 900; color: var(--accent); margin-top: 8px; }
         .sub-stat { font-size: 1.5rem; font-weight: 900; color: #fff; }
         
-        /* Importer UI */
         .importer-container { margin-top: 50px; background: var(--glass); border: 1px solid var(--border); border-radius: 32px; padding: 30px; }
         .file-input { background: rgba(255,255,255,0.05); border: 1px dashed var(--border); padding: 20px; border-radius: 16px; width: 100%; color: #fff; margin-bottom: 15px; }
     </style>
@@ -402,8 +425,8 @@
             <div class="line"></div>
         </div>
         <p class="label" style="text-transform:none; letter-spacing:0; font-size:0.8rem; margin-bottom:20px;">
-            Parallel Check Enabled: Upload CSV. System will verify 100 IDs at a time against "valid_ids".
-            <br><span style="opacity:0.6;">Mapping: Column D = Student ID, Column G = Vote Choice.</span>
+            Parallel Check Enabled: Upload CSV. System will verify phone numbers against linked Student IDs.
+            <br><span style="opacity:0.6;">Mapping: Column A = Vote, Column E = Phone Number.</span>
         </p>
         
         <input type="file" id="sms-csv" class="file-input" accept=".csv">
